@@ -7,8 +7,8 @@ from django.core.exceptions import ValidationError
 from django.core.management.base import BaseCommand, CommandError
 from django.core.validators import URLValidator
 from openai import OpenAI
-
-from core import models
+from selenium import webdriver
+from selenium.webdriver.common.by import By
 
 RECIPE_URL_ARG = "recipe_url"
 is_url = URLValidator()
@@ -38,6 +38,18 @@ Your response should contain a single "recipe" field only. If you cannot find a 
 You must only output a valid JSON object and nothing else.
 """
 
+SYSTEM_MESSAGE_RECIPE_SCHEMA = """
+You are a recipe parser. You accept text from a web page and find a recipe in it if one is present.
+
+Recipe information must be returned in JSON format, following the recipe schema described at https://schema.org/Recipe. No other fields should be included.
+
+Your response should only contain a single "recipe" field at the top level. If you cannot find a recipe in the provided content, this field should be null.
+
+Populate as many of the available fields on the recipe schema as possible. Ensure correct formats are used, such as ISO 8601 for durations, or QuantitativeValue instead of text where possible.
+
+You must only output a valid JSON object and nothing else.
+"""
+
 
 def _get_recipe_url(options):
     recipe_url = options[RECIPE_URL_ARG]
@@ -59,34 +71,57 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         client = OpenAI(api_key=settings.OPEN_API_SECRET_KEY)
         recipe_url = _get_recipe_url(options)
-        self.stdout.write(f"Getting recipe content from: {recipe_url}")
+        self.stdout.write(f"Getting page content from: {recipe_url}")
 
-        res = requests.get(recipe_url)
-        soup = BeautifulSoup(res.text, "html.parser")
+        # res = requests.get(recipe_url)
+        # content = res.text
+
+        options = webdriver.FirefoxOptions()
+        options.add_argument("-headless")
+        browser = webdriver.Firefox(options=options)
+        browser.get(recipe_url)
+        content = browser.page_source
+
+        self.stdout.write(content)
+        soup = BeautifulSoup(content, "html.parser")
+
+        # self.stdout.write(res.text)
+
+        self.stdout.write("Checking for existing recipe schema on page")
+
+        schemas = soup.find_all("script", attrs={"type": "application/ld+json"})
+        for s in schemas:
+            try:
+                parsed = json.loads(s.text)
+                if parsed.get("@type") == "Recipe":
+                    self.stdout.write(self.style.SUCCESS("Found an existing schema"))
+                    self.stdout.write(json.dumps(parsed, indent=4))
+                    return
+            except Exception:
+                self.stdout.write(self.style.WARNING("Failed to parse schema content:"))
+                self.stdout.write(self.style.WARNING(s.text))
+
         text = soup.get_text()
 
-        self.stdout.write("Generating...")
+        # self.stdout.write(text)
+
+        self.stdout.write("Generating a schema from page content")
         response = client.chat.completions.create(
             model="gpt-3.5-turbo-1106",
             response_format={"type": "json_object"},
             messages=[
                 {
                     "role": "system",
-                    "content": SYSTEM_MESSAGE,
+                    "content": SYSTEM_MESSAGE_RECIPE_SCHEMA,
                 },
                 {"role": "user", "content": text},
             ],
         )
 
-        self.stdout.write(self.style.SUCCESS("Generated a recipe!"))
-
         result = json.loads(response.choices[0].message.content)
         if result["recipe"] is None:
             raise CommandError("Could not find a recipe at URL")
 
-        recipe = models.Recipe.objects.create(
-            source_url=recipe_url,
-            source_text=text,
-            name=result["recipe"]["name"],
-            prep_time_minutes=result["recipe"]["time"],
-        )
+        self.stdout.write(self.style.SUCCESS("Generated a recipe!"))
+
+        self.stdout.write(json.dumps(result, indent=4))
