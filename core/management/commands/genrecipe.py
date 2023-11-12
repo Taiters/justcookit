@@ -1,3 +1,5 @@
+import json
+
 import requests
 from bs4 import BeautifulSoup
 from django.conf import settings
@@ -5,6 +7,8 @@ from django.core.exceptions import ValidationError
 from django.core.management.base import BaseCommand, CommandError
 from django.core.validators import URLValidator
 from openai import OpenAI
+
+from core import models
 
 RECIPE_URL_ARG = "recipe_url"
 is_url = URLValidator()
@@ -15,11 +19,11 @@ Recipe information is represented as a JSON object which consists of only the fo
 * name: The name of the recipe
 * ingredients: A list of "Ingredient" objects
 * steps: A list of "Step" objects
-* time: The amount of time, in minutes, to prepare this recipe
+* time: The amount of time in minutes to prepare this recipe as an integer
 
 Each "Ingredient" object should contain only the following fields:
-* name: The name of the ingredient
-* quantity: The quantity of the ingredient. The "unit" for this quantity is stored in a separate field
+* name: The name of the ingredient. Normalize this by capitalizing and removing any quantities
+* quantity: The quantity of the ingredient as an integer. The "unit" for this quantity is stored in a separate field
 * unit: The unit of measurement for the "quantity" field
 
 Each "step" should contain only the following fields:
@@ -59,6 +63,7 @@ class Command(BaseCommand):
 
         res = requests.get(recipe_url)
         soup = BeautifulSoup(res.text, "html.parser")
+        text = soup.get_text()
 
         self.stdout.write("Generating...")
         response = client.chat.completions.create(
@@ -69,9 +74,19 @@ class Command(BaseCommand):
                     "role": "system",
                     "content": SYSTEM_MESSAGE,
                 },
-                {"role": "user", "content": soup.get_text()},
+                {"role": "user", "content": text},
             ],
         )
 
         self.stdout.write(self.style.SUCCESS("Generated a recipe!"))
-        self.stdout.write(response.choices[0].message.content)
+
+        result = json.loads(response.choices[0].message.content)
+        if result["recipe"] is None:
+            raise CommandError("Could not find a recipe at URL")
+
+        recipe = models.Recipe.objects.create(
+            source_url=recipe_url,
+            source_text=text,
+            name=result["recipe"]["name"],
+            prep_time_minutes=result["recipe"]["time"],
+        )
